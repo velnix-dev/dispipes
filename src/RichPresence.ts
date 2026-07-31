@@ -20,12 +20,41 @@ export interface PresenceButton {
     url: string;
 }
 
-export type PresenceType = 0 | 1 | 2 | 3 | 4;
+/** Discord's ActivityType enum. SET_ACTIVITY IPC only accepts 0, 2, 3 and 5. */
+export type PresenceType =
+    | "playing"
+    | "streaming"
+    | "listening"
+    | "watching"
+    | "custom"
+    | "competing"
+    | 0
+    | 1
+    | 2
+    | 3
+    | 4
+    | 5;
+
+export const PresenceActivityType = Object.freeze({
+    Playing: 0,
+    Streaming: 1,
+    Listening: 2,
+    Watching: 3,
+    Custom: 4,
+    Competing: 5
+} as const);
+
+export interface PresenceEmoji {
+    name: string;
+    id?: string;
+    animated?: boolean;
+}
 
 export interface PresenceData {
     state?: string;
     details?: string;
     type?: PresenceType;
+    emoji?: PresenceEmoji;
     startTimestamp?: number | Date;
     endTimestamp?: number | Date;
     assets?: PresenceAssets;
@@ -64,13 +93,13 @@ interface PendingRequest {
 
 export class DisPipesError extends Error {
     public readonly fatal: boolean;
-    public readonly code: number | undefined;
+    public readonly code?: number;
 
     constructor(message: string, options?: { fatal?: boolean; code?: number }) {
         super(message);
         this.name = "DisPipesError";
         this.fatal = options?.fatal ?? false;
-        this.code = options?.code;
+        if (options?.code !== undefined) this.code = options.code;
         Object.setPrototypeOf(this, new.target.prototype);
     }
 }
@@ -83,6 +112,17 @@ export class RichPresence extends EventEmitter {
     private static readonly IPC_OPCODE_PONG = 4;
     private static readonly MAX_PACKET_SIZE = 10 * 1024 * 1024;
     private static readonly REQUEST_TIMEOUT = 10_000;
+
+    private static readonly ACTIVITY_TYPE_NAMES: Readonly<Record<number, string>> = Object.freeze({
+        0: "Playing",
+        1: "Streaming",
+        2: "Listening",
+        3: "Watching",
+        4: "Custom",
+        5: "Competing"
+    });
+
+    private static readonly IPC_SUPPORTED_ACTIVITY_TYPES = new Set<number>([0, 2, 3, 5]);
 
     private readonly clientId: string;
     private readonly autoReconnect: boolean;
@@ -137,6 +177,11 @@ export class RichPresence extends EventEmitter {
             this.reconnectAttempt = 0;
 
             consola.success("DisPipes connected to Discord.");
+            consola.info(
+                `RPC ready • SET_ACTIVITY IPC supports: ${[0, 2, 3, 5]
+                    .map((type) => `${type} ${this.activityTypeName(type)}`)
+                    .join(" • ")}`
+            );
             this.emit("ready");
         } catch (error: unknown) {
             this.connecting = false;
@@ -158,89 +203,107 @@ export class RichPresence extends EventEmitter {
         this.validatePresence(presence);
 
         const activity: Record<string, unknown> = {};
+        const activityType = this.resolveActivityType(presence.type);
 
         if (presence.state !== undefined) activity.state = presence.state;
         if (presence.details !== undefined) activity.details = presence.details;
-        if (presence.type !== undefined) activity.type = presence.type;
+        if (activityType !== undefined) activity.type = activityType;
+
+        if (presence.emoji !== undefined) {
+            activity.emoji = {
+                name: presence.emoji.name,
+                ...(presence.emoji.id !== undefined ? {id: presence.emoji.id} : {}),
+                ...(presence.emoji.animated !== undefined ? {animated: presence.emoji.animated} : {})
+            };
+        }
 
         if (presence.startTimestamp !== undefined || presence.endTimestamp !== undefined) {
             const timestamps: Record<string, number> = {};
-
-            if (presence.startTimestamp !== undefined) {
-                timestamps.start = this.timestamp(presence.startTimestamp);
-            }
-            if (presence.endTimestamp !== undefined) {
-                timestamps.end = this.timestamp(presence.endTimestamp);
-            }
-
+            if (presence.startTimestamp !== undefined) timestamps.start = this.timestamp(presence.startTimestamp);
+            if (presence.endTimestamp !== undefined) timestamps.end = this.timestamp(presence.endTimestamp);
             activity.timestamps = timestamps;
         }
 
         if (presence.assets !== undefined) {
             const assets: Record<string, string> = {};
-
             if (presence.assets.largeImageKey !== undefined) assets.large_image = presence.assets.largeImageKey;
             if (presence.assets.largeImageText !== undefined) assets.large_text = presence.assets.largeImageText;
             if (presence.assets.smallImageKey !== undefined) assets.small_image = presence.assets.smallImageKey;
             if (presence.assets.smallImageText !== undefined) assets.small_text = presence.assets.smallImageText;
-
             if (Object.keys(assets).length > 0) activity.assets = assets;
         }
 
         if (presence.buttons !== undefined && presence.buttons.length > 0) {
-            activity.buttons = presence.buttons.map((button) => ({
-                label: button.label,
-                url: button.url
-            }));
+            activity.buttons = presence.buttons.map((button) => ({label: button.label, url: button.url}));
         }
 
-        if (
-            presence.partyId !== undefined ||
-            presence.partySize !== undefined ||
-            presence.partyMax !== undefined
-        ) {
+        if (presence.partyId !== undefined || presence.partySize !== undefined || presence.partyMax !== undefined) {
             const party: Record<string, unknown> = {};
-
             if (presence.partyId !== undefined) party.id = presence.partyId;
             if (presence.partySize !== undefined || presence.partyMax !== undefined) {
                 party.size = [presence.partySize ?? 0, presence.partyMax ?? 0];
             }
-
             activity.party = party;
         }
 
-        if (
-            presence.matchSecret !== undefined ||
-            presence.joinSecret !== undefined ||
-            presence.spectateSecret !== undefined
-        ) {
+        if (presence.matchSecret !== undefined || presence.joinSecret !== undefined || presence.spectateSecret !== undefined) {
             const secrets: Record<string, string> = {};
-
             if (presence.matchSecret !== undefined) secrets.match = presence.matchSecret;
             if (presence.joinSecret !== undefined) secrets.join = presence.joinSecret;
             if (presence.spectateSecret !== undefined) secrets.spectate = presence.spectateSecret;
-
             activity.secrets = secrets;
         }
 
         if (presence.instance !== undefined) activity.instance = presence.instance;
 
-        await this.sendCommand("SET_ACTIVITY", {
-            pid: process.pid,
-            activity
-        });
+        const typeName = this.activityTypeName(activityType);
+        const ipcSupported = activityType === undefined || RichPresence.IPC_SUPPORTED_ACTIVITY_TYPES.has(activityType);
 
+        consola.debug(
+            `RPC SET_ACTIVITY → ${this.formatActivityType(activityType)}${ipcSupported ? "" : " • Discord IPC may reject this type"}`
+        );
+
+        try {
+            await this.sendCommand("SET_ACTIVITY", {pid: process.pid, activity});
+        } catch (error: unknown) {
+            const normalized = this.normalizeError(error, "Discord rejected the Rich Presence activity.");
+            const code = normalized.code !== undefined ? ` [code ${normalized.code}]` : "";
+
+            consola.error(`Rich Presence update failed${code}`);
+            consola.info([
+                `Activity: ${typeName}`,
+                `Type: ${activityType ?? "default (0)"}`,
+                `IPC support: ${ipcSupported ? "supported" : "not supported by SET_ACTIVITY"}`,
+                `Message: ${normalized.message}`,
+                normalized.code !== undefined ? `Discord code: ${normalized.code}` : undefined
+            ].filter((line): line is string => line !== undefined).join("\n"));
+
+            this.emit("presenceError", normalized, presence);
+            throw normalized;
+        }
+
+        consola.success(`Rich Presence updated • ${this.formatActivityType(activityType)}`);
         this.emit("presenceUpdate", presence);
     }
 
     public async clearPresence(): Promise<void> {
         if (!this.connected) return;
 
-        await this.sendCommand("SET_ACTIVITY", {
-            pid: process.pid,
-            activity: null
-        });
+        consola.debug("RPC SET_ACTIVITY → clearing Rich Presence");
 
+        try {
+            await this.sendCommand("SET_ACTIVITY", {
+                pid: process.pid,
+                activity: null
+            });
+        } catch (error: unknown) {
+            const normalized = this.normalizeError(error, "Discord rejected the presence clear request.");
+            consola.error(`Failed to clear Rich Presence${normalized.code !== undefined ? ` [code ${normalized.code}]` : ""}`);
+            this.emit("presenceError", normalized, null);
+            throw normalized;
+        }
+
+        consola.success("Rich Presence cleared.");
         this.emit("presenceClear");
     }
 
@@ -263,7 +326,7 @@ export class RichPresence extends EventEmitter {
             this.reconnectAttempt = 0;
             this.disconnecting = false;
             this.emit("disconnect", undefined);
-            consola.info("DisPipes disconnected from Discord.");
+            consola.success("DisPipes disconnected from Discord.");
         }
     }
 
@@ -383,14 +446,6 @@ export class RichPresence extends EventEmitter {
     private async handshake(): Promise<void> {
         const socket = this.getSocket();
 
-        await this.writePacket(
-            socket,
-            this.createPacket(RichPresence.IPC_OPCODE_HANDSHAKE, {
-                v: 1,
-                client_id: this.clientId
-            })
-        );
-
         await new Promise<void>((resolve, reject) => {
             let settled = false;
 
@@ -408,6 +463,7 @@ export class RichPresence extends EventEmitter {
             };
 
             const onReady = (): void => {
+                consola.success("Discord IPC handshake completed.");
                 finish(resolve);
             };
 
@@ -417,11 +473,30 @@ export class RichPresence extends EventEmitter {
             };
 
             const timeout = setTimeout(() => {
-                finish(() => reject(new DisPipesError("Discord IPC handshake timed out.")));
+                finish(() => reject(new DisPipesError(
+                    "Discord IPC handshake timed out.",
+                    {code: 408}
+                )));
             }, RichPresence.REQUEST_TIMEOUT);
 
+            // Register listeners BEFORE sending the handshake so a very fast
+            // Discord READY response cannot be missed.
             this.once("READY", onReady);
             this.once("error", onError);
+
+            void this.writePacket(
+                socket,
+                this.createPacket(RichPresence.IPC_OPCODE_HANDSHAKE, {
+                    v: 1,
+                    client_id: this.clientId
+                })
+            ).catch((error: unknown) => {
+                const normalized = this.normalizeError(
+                    error,
+                    "Failed to send Discord IPC handshake."
+                );
+                finish(() => reject(normalized));
+            });
         });
     }
 
@@ -464,7 +539,6 @@ export class RichPresence extends EventEmitter {
     ): Promise<unknown> {
         const socket = this.getSocket();
         const packet = this.createPacket(opcode, data);
-
         const nonce = typeof data.nonce === "string" ? data.nonce : undefined;
 
         if (!waitForResponse && nonce === undefined) {
@@ -479,7 +553,10 @@ export class RichPresence extends EventEmitter {
         return new Promise<unknown>((resolve, reject) => {
             const timer = setTimeout(() => {
                 this.pendingRequests.delete(nonce);
-                reject(new DisPipesError(`Discord IPC request timed out: ${String(data.cmd ?? "HANDSHAKE")}`));
+                reject(new DisPipesError(
+                    `Discord IPC request timed out waiting for a response to ${String(data.cmd ?? "HANDSHAKE")}.`,
+                    {code: 408}
+                ));
             }, RichPresence.REQUEST_TIMEOUT);
 
             this.pendingRequests.set(nonce, {resolve, reject, timer});
@@ -487,9 +564,10 @@ export class RichPresence extends EventEmitter {
             void this.writePacket(socket, packet).catch((error: unknown) => {
                 const pending = this.pendingRequests.get(nonce);
                 if (pending === undefined) return;
+
                 clearTimeout(pending.timer);
                 this.pendingRequests.delete(nonce);
-                pending.reject(error);
+                pending.reject(this.normalizeError(error, "Failed to write Discord IPC request."));
             });
         });
     }
@@ -540,9 +618,7 @@ export class RichPresence extends EventEmitter {
 
     private handlePacket(packet: IpcPacket): void {
         if (packet.opcode === RichPresence.IPC_OPCODE_CLOSE) {
-            this.handleFatalError(
-                new DisPipesError("Discord closed the IPC connection.", {fatal: false})
-            );
+            this.handleFatalError(new DisPipesError("Discord closed the IPC connection.", {fatal: false}));
             return;
         }
 
@@ -559,36 +635,33 @@ export class RichPresence extends EventEmitter {
         }
 
         if (!this.isRecord(packet.data)) {
-            this.handleFatalError(
-                new DisPipesError("Discord sent a malformed IPC frame.", {fatal: true})
-            );
+            this.handleFatalError(new DisPipesError("Discord sent a malformed IPC frame.", {fatal: true}));
             return;
         }
 
         const response = packet.data as IpcResponse;
+        const isError = response.evt === "ERROR";
+        const errorData = isError && this.isRecord(response.data)
+            ? (response.data as DiscordErrorData)
+            : {};
+        const discordError = isError ? this.classifyDiscordError(errorData) : undefined;
+        let matchedPendingRequest = false;
 
-        if (response.evt === "ERROR") {
-            const errorData = this.isRecord(response.data)
-                ? (response.data as DiscordErrorData)
-                : {};
-            this.handleError(this.classifyDiscordError(errorData));
-            return;
-        }
-
-        if (response.nonce !== undefined) {
+        if (typeof response.nonce === "string") {
             const pending = this.pendingRequests.get(response.nonce);
+
             if (pending !== undefined) {
+                matchedPendingRequest = true;
                 clearTimeout(pending.timer);
                 this.pendingRequests.delete(response.nonce);
 
-                if (response.evt === "ERROR") {
-                    pending.reject(this.classifyDiscordError(
-                        this.isRecord(response.data) ? (response.data as DiscordErrorData) : {}
-                    ));
-                } else {
-                    pending.resolve(response.data);
-                }
+                if (discordError !== undefined) pending.reject(discordError);
+                else pending.resolve(response.data);
             }
+        }
+
+        if (discordError !== undefined && !matchedPendingRequest) {
+            this.reportError(discordError);
         }
 
         if (response.evt !== undefined && response.evt !== null) {
@@ -605,12 +678,19 @@ export class RichPresence extends EventEmitter {
     }
 
     private classifyDiscordError(data: DiscordErrorData): DisPipesError {
-        const message = data.message ?? "Discord returned an IPC error.";
-        const options: { fatal?: boolean; code?: number } = {fatal: false};
+        const code = data.code;
+        const rawMessage = data.message ?? "Discord returned an IPC error.";
+        const hint = code === 4000
+            ? " SET_ACTIVITY only accepts activity types 0 (Playing), 2 (Listening), 3 (Watching), and 5 (Competing) over Discord IPC. Type 1 (Streaming) and type 4 (Custom Status) exist in Discord's broader ActivityType model but are not accepted by this IPC command."
+            : "";
 
-        if (data.code !== undefined) options.code = data.code;
+        const options: {fatal?: boolean; code?: number} = {fatal: false};
+        if (code !== undefined) options.code = code;
 
-        return new DisPipesError(message, options);
+        return new DisPipesError(
+            `Discord IPC error${code !== undefined ? ` ${code}` : ""}: ${rawMessage}${hint}`,
+            options
+        );
     }
 
     private handleSocketError(error: Error): void {
@@ -660,11 +740,11 @@ export class RichPresence extends EventEmitter {
     }
 
     private reportError(error: DisPipesError): void {
-        if (error.fatal) {
-            consola.error(`[FATAL] ${error.message}`, error.code !== undefined ? `(code ${error.code})` : "");
-        } else {
-            consola.warn(`[RECOVERABLE] ${error.message}`, error.code !== undefined ? `(code ${error.code})` : "");
-        }
+        const code = error.code !== undefined ? ` [code ${error.code}]` : "";
+        const message = `[${error.fatal ? "FATAL" : "RECOVERABLE"}] ${error.message}${code}`;
+
+        if (error.fatal) consola.error(message);
+        else consola.warn(message);
 
         this.emit("error", error);
     }
@@ -686,7 +766,7 @@ export class RichPresence extends EventEmitter {
         );
 
         consola.info(
-            `Discord IPC reconnect scheduled in ${delay}ms (attempt ${this.reconnectAttempt}).`
+            `Discord IPC reconnect scheduled • attempt ${this.reconnectAttempt} • retry in ${delay}ms`
         );
         this.emit("reconnecting", {attempt: this.reconnectAttempt, delay});
 
@@ -706,54 +786,78 @@ export class RichPresence extends EventEmitter {
 
     private normalizeError(error: unknown, fallback: string): DisPipesError {
         if (error instanceof DisPipesError) return error;
-        if (error instanceof Error) return new DisPipesError(error.message || fallback);
+
+        if (error instanceof Error) {
+            return new DisPipesError(error.message || fallback);
+        }
+
+        if (typeof error === "string" && error.trim().length > 0) {
+            return new DisPipesError(error);
+        }
+
         return new DisPipesError(fallback);
     }
 
     private validatePresence(presence: PresenceData): void {
+        if (!presence || typeof presence !== "object") {
+            throw new DisPipesError("Presence must be an object.");
+        }
+
+        const activityType = this.resolveActivityType(presence.type);
+
+        if (presence.type !== undefined && activityType === undefined) {
+            throw new DisPipesError(
+                "Invalid presence type. Use playing, streaming, listening, watching, custom, competing or 0, 1, 2, 3, 4, 5."
+            );
+        }
+
+        if (activityType !== undefined && !RichPresence.IPC_SUPPORTED_ACTIVITY_TYPES.has(activityType)) {
+            consola.debug(
+                `Presence type ${activityType} (${this.activityTypeName(activityType)}) is not accepted by SET_ACTIVITY IPC; forwarding to Discord for its authoritative error response.`
+            );
+        }
+
         if (presence.buttons !== undefined && presence.buttons.length > 2) {
             throw new DisPipesError("Discord allows a maximum of 2 presence buttons.");
         }
 
-        for (const button of presence.buttons ?? []) {
-            if (button.label.trim().length === 0) {
-                throw new DisPipesError("Presence button labels cannot be empty.");
+        for (const [index, button] of (presence.buttons ?? []).entries()) {
+            if (!button || button.label.trim().length === 0) {
+                throw new DisPipesError(`Presence button ${index + 1} has an empty label.`);
             }
 
             let url: URL;
-
             try {
                 url = new URL(button.url);
             } catch {
-                throw new DisPipesError(`Invalid presence button URL: ${button.url}`);
+                throw new DisPipesError(`Presence button ${index + 1} has an invalid URL: ${button.url}`);
             }
 
             if (url.protocol !== "http:" && url.protocol !== "https:") {
-                throw new DisPipesError(`Invalid presence button URL: ${button.url}`);
+                throw new DisPipesError(`Presence button ${index + 1} must use HTTP or HTTPS.`);
             }
         }
 
-        if (presence.type !== undefined && ![0, 1, 2, 3, 4].includes(presence.type)) {
-            throw new DisPipesError("Presence type must be one of Discord's supported activity types: 0, 1, 2, 3, or 4.");
+        if (presence.emoji !== undefined) {
+            if (presence.emoji.name.trim().length === 0) {
+                throw new DisPipesError("Presence emoji name cannot be empty.");
+            }
+            if (presence.emoji.id !== undefined && !/^\d{17,20}$/.test(presence.emoji.id)) {
+                throw new DisPipesError("Presence emoji id must be a valid Discord snowflake.");
+            }
         }
 
-        for (const value of [presence.details, presence.state]) {
+        for (const [name, value] of [["details", presence.details], ["state", presence.state]] as const) {
             if (value !== undefined && value.length > 128) {
-                throw new DisPipesError("Presence details and state must be 128 characters or fewer.");
+                throw new DisPipesError(`Presence ${name} must be 128 characters or fewer.`);
             }
         }
 
-        if (
-            presence.partySize !== undefined &&
-            (!Number.isInteger(presence.partySize) || presence.partySize < 0)
-        ) {
+        if (presence.partySize !== undefined && (!Number.isInteger(presence.partySize) || presence.partySize < 0)) {
             throw new DisPipesError("partySize must be a non-negative integer.");
         }
 
-        if (
-            presence.partyMax !== undefined &&
-            (!Number.isInteger(presence.partyMax) || presence.partyMax < 0)
-        ) {
+        if (presence.partyMax !== undefined && (!Number.isInteger(presence.partyMax) || presence.partyMax < 0)) {
             throw new DisPipesError("partyMax must be a non-negative integer.");
         }
 
@@ -764,6 +868,32 @@ export class RichPresence extends EventEmitter {
         ) {
             throw new DisPipesError("partySize cannot be greater than partyMax.");
         }
+    }
+
+    private resolveActivityType(type: PresenceType | undefined): number | undefined {
+        if (type === undefined) return undefined;
+        if (typeof type === "number") return type;
+
+        const aliases: Record<string, number> = {
+            playing: 0,
+            streaming: 1,
+            listening: 2,
+            watching: 3,
+            custom: 4,
+            competing: 5
+        };
+
+        return aliases[type];
+    }
+
+    private activityTypeName(type: number | undefined): string {
+        if (type === undefined) return "Playing (default)";
+        return RichPresence.ACTIVITY_TYPE_NAMES[type] ?? `Unknown (${type})`;
+    }
+
+    private formatActivityType(type: number | undefined): string {
+        if (type === undefined) return "Playing (0)";
+        return `${this.activityTypeName(type)} (${type})`;
     }
 
     private timestamp(value: number | Date): number {
