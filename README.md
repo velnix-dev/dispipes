@@ -24,8 +24,10 @@ rpc.setPresence({
     type: 0,
     state: "Running",
     startTimestamp: new Date(),
-    largeImageKey: "large_image",
-    largeImageText: "DisPipes"
+    assets: {
+        largeImageKey: "large_image",
+        largeImageText: "DisPipes"
+    }
 });
 ```
 
